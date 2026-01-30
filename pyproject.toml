@@ -1,0 +1,74 @@
+[project]
+name = "datamesh"
+version = "0.1.0"
+description = "Planetary-Scale Conversational Data Mesh Architecture"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+keywords = ["database", "distributed-systems", "data-mesh", "sqlite", "postgresql"]
+authors = [
+    { name = "DataMesh Team" }
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Database",
+    "Topic :: System :: Distributed Computing",
+]
+
+dependencies = [
+    # Core (no external deps for local mode)
+]
+
+[project.optional-dependencies]
+postgresql = [
+    "asyncpg>=0.29.0",
+]
+s3 = [
+    "boto3>=1.34.0",
+]
+full = [
+    "asyncpg>=0.29.0",
+    "boto3>=1.34.0",
+    "uvloop>=0.19.0",
+]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.23.0",
+    "mypy>=1.8.0",
+    "ruff>=0.2.0",
+]
+
+[project.scripts]
+datamesh = "datamesh.__main__:run"
+
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["datamesh*"]
+
+[tool.mypy]
+python_version = "3.10"
+strict = true
+warn_return_any = true
+warn_unused_ignores = true
+disallow_untyped_defs = true
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "N", "D", "UP", "S", "B", "A", "C4", "ICN", "PIE", "T20", "SIM", "TCH"]
+ignore = ["D100", "D104", "D107", "D203", "D213"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
