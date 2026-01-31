@@ -2,28 +2,40 @@
 SOTA Multi-Field Vector Search Integration with DataMesh
 
 Features:
-    1. Multi-field embedding (concatenated persona fields)
-    2. Hybrid search with metadata filtering
-    3. Re-ranking with cross-encoder (optional)
-    4. Streaming dataset processing
-    5. DataMesh integration for distributed storage
+    1. Multi-field embedding (weighted concatenation)
+    2. Hybrid search (vector + metadata filtering)
+    3. Re-ranking with Cross-Encoder (SOTA)
+    4. Streaming dataset processing with efficient batching
+    5. REAL DataMesh API integration (Async AP Store)
+    6. HIGH PERFORMANCE: Async Producer-Consumer Pipeline + Thread Offloading
+    7. OPTIMIZATION: INT8 Dynamic Quantization + HNSW Tuning for CPU
 
 Dataset: nvidia/Nemotron-Personas-Brazil
-    - 20 columns including persona fields and demographics
-    - Persona columns: professional, sports, arts, travel, culinary, personality
-    - Demographics: age, sex, education_level, occupation, municipality, state, country
+Model: intfloat/multilingual-e5-base (SOTA) + cross-encoder/ms-marco-MiniLM-L-6-v2
 """
 
 from __future__ import annotations
 
 import asyncio
 import time
-from typing import Any, Iterator, Optional, Callable
+import sys
+import os
+import hashlib
+import warnings
+from typing import Any, Iterator, Optional, List, Tuple
 from dataclasses import dataclass, field
 from collections import defaultdict
-import hashlib
+from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor
 
-# Core imports
+# Robustly suppress PyTorch/HuggingFace warnings
+warnings.filterwarnings("ignore", message=".*torch.ao.quantization is deprecated.*")
+warnings.filterwarnings("ignore", category=DeprecationWarning, module="torch.ao.quantization")
+warnings.filterwarnings("ignore", category=FutureWarning)
+
+# Ensure workspace root is in path for datamesh import
+sys.path.append(os.getcwd())
+
 import numpy as np
 
 # VectorSearch
@@ -41,36 +53,20 @@ from vector_search.core.errors import Result, Ok, Err
 from vector_search.embeddings import MockEmbedder
 from vector_search.index import HNSWIndex
 
+# DataMesh API
+try:
+    from datamesh.storage import create_ap_store
+    from datamesh.core.types import Result as DMResult
+    print("✅ DataMesh API loaded successfully")
+except ImportError:
+    print("❌ DataMesh API not found. Please run from workspace root.")
+    sys.exit(1)
+
 
 # =============================================================================
 # DATASET SCHEMA
 # =============================================================================
 
-# All columns in nvidia/Nemotron-Personas-Brazil
-DATASET_COLUMNS = [
-    "uuid",
-    "professional_persona",
-    "sports_persona", 
-    "arts_persona",
-    "travel_persona",
-    "culinary_persona",
-    "personality",
-    "name",
-    "career_goals_and_ambitions",
-    "skills_and_expertise",
-    "hobbies_and_interests",
-    "cultural_background",
-    "sex",
-    "age",
-    "marital_status",
-    "education_level",
-    "occupation",
-    "municipality",
-    "state",
-    "country",
-]
-
-# Columns to embed (rich text fields)
 EMBEDDING_COLUMNS = [
     "professional_persona",
     "sports_persona",
@@ -84,7 +80,6 @@ EMBEDDING_COLUMNS = [
     "cultural_background",
 ]
 
-# Columns for metadata filtering
 FILTER_COLUMNS = [
     "sex",
     "age",
@@ -110,489 +105,381 @@ class SOTAConfig:
     dataset_split: str = "train"
     max_samples: int = 5000
     
-    # Embedding strategy
+    # Embedding strategy (SOTA Upgrade)
     embedding_columns: list[str] = field(default_factory=lambda: EMBEDDING_COLUMNS)
-    embedding_model: str = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
-    embedding_dimension: int = 384
-    batch_size: int = 16
+    embedding_model: str = "intfloat/multilingual-e5-base"
+    embedding_dimension: int = 768
+    batch_size: int = 64
     
-    # HNSW (SOTA parameters)
-    hnsw_M: int = 32              # Higher M for better recall
-    hnsw_M_max: int = 64          # Larger M at layer 0
-    hnsw_ef_construction: int = 400  # Higher ef for quality
-    hnsw_ef_search: int = 100     # Higher ef at search time
+    # HNSW (Tuned for Python CPU)
+    # Reduced parameters to alleviate Python loop overhead
+    hnsw_M: int = 16              
+    hnsw_ef_construction: int = 100 
+    hnsw_ef_search: int = 50      
     metric: MetricType = MetricType.COSINE
     
-    # Search
-    enable_reranking: bool = False
-    rerank_top_k: int = 100       # Fetch more, then rerank
-    final_k: int = 10
+    # Search & Reranking
+    enable_reranking: bool = True
+    rerank_model: str = "cross-encoder/ms-marco-MiniLM-L-6-v2"
+    rerank_top_k: int = 50
+    final_k: int = 5
     
-    # Multi-field weighting
+    # Performance
+    num_workers: int = 2
+    pipeline_queue_size: int = 10
+    
+    # Inference Optimization
+    use_quantization: bool = True # Enable INT8 Dynamic Quantization
+    
+    # Field weights
     field_weights: dict[str, float] = field(default_factory=lambda: {
-        "professional_persona": 1.5,
-        "skills_and_expertise": 1.3,
+        "professional_persona": 2.0,
+        "skills_and_expertise": 1.5,
         "career_goals_and_ambitions": 1.2,
         "personality": 1.0,
-        "hobbies_and_interests": 0.9,
-        "cultural_background": 0.8,
-        "sports_persona": 0.7,
-        "arts_persona": 0.7,
-        "travel_persona": 0.6,
-        "culinary_persona": 0.5,
+        "hobbies_and_interests": 0.8,
+        "cultural_background": 0.5,
     })
 
 
 # =============================================================================
-# MULTI-FIELD EMBEDDER
+# SOTA EMBEDDER (Bi-Encoder + Cross-Encoder)
 # =============================================================================
 
-class MultiFieldEmbedder:
-    """
-    SOTA multi-field embedding with weighted aggregation.
-    
-    Strategies:
-        1. Concatenate all fields into single text
-        2. Embed each field separately, weighted average
-        3. Embed with field-specific prompts
-    """
+class SOTAEmbedder:
+    """Handles both Embedding (Bi-Encoder) and Reranking (Cross-Encoder)."""
     
     def __init__(self, config: SOTAConfig):
         self.config = config
-        self._embedder = None
-        self._model = None
-    
-    @property
-    def embedder(self):
-        """Lazy-load embedder."""
-        if self._embedder is None:
-            try:
-                from sentence_transformers import SentenceTransformer
-                self._model = SentenceTransformer(self.config.embedding_model)
-                print(f"✅ Loaded multilingual model: {self.config.embedding_model}")
-            except ImportError:
-                print("⚠️ sentence-transformers not available, using MockEmbedder")
-                self._embedder = MockEmbedder(dimension=self.config.embedding_dimension)
-        return self._embedder
-    
-    def embed_record(self, record: dict[str, Any]) -> np.ndarray:
-        """
-        Embed a single record using weighted multi-field strategy.
+        self._bi_encoder = None
+        self._cross_encoder = None
+        self._initialized = False
+        self._executor = ThreadPoolExecutor(max_workers=config.num_workers)
+        self._device = "cpu"
         
-        SOTA approach: Weight important fields higher.
-        """
-        if self._model is not None:
-            # Concatenate weighted fields
-            parts = []
-            for col in self.config.embedding_columns:
-                text = record.get(col, "")
-                if text:
-                    weight = self.config.field_weights.get(col, 1.0)
-                    # Repeat important fields (simple weighting)
-                    if weight >= 1.5:
-                        parts.append(f"{col}: {text}")
-                        parts.append(text)  # Repeat
-                    elif weight >= 1.0:
-                        parts.append(f"{col}: {text}")
-                    else:
-                        parts.append(text[:200])  # Truncate low-weight
+    def _ensure_initialized(self):
+        if self._initialized: return
+        
+        try:
+            import torch
+            from sentence_transformers import SentenceTransformer, CrossEncoder
             
-            combined = " ".join(parts)
+            self._device = "cuda" if torch.cuda.is_available() else "cpu"
+            print(f"💻 Inference Device: {self._device.upper()}")
             
-            # Embed
-            embedding = self._model.encode(
-                combined,
-                normalize_embeddings=True,
-                show_progress_bar=False,
+            # Load Bi-Encoder
+            print(f"🔄 Loading Bi-Encoder: {self.config.embedding_model}")
+            self._bi_encoder = SentenceTransformer(
+                self.config.embedding_model, 
+                device=self._device
             )
-            return embedding
-        else:
-            # Mock fallback
-            result = self.embedder.embed(str(record))
-            if result.is_ok():
-                return result.unwrap().to_numpy()
-            return np.random.randn(self.config.embedding_dimension).astype(np.float32)
-    
-    def embed_batch(self, records: list[dict[str, Any]]) -> np.ndarray:
-        """Batch embed records."""
-        if self._model is not None:
-            texts = []
-            for record in records:
-                parts = []
-                for col in self.config.embedding_columns:
-                    text = record.get(col, "")
-                    if text:
-                        weight = self.config.field_weights.get(col, 1.0)
-                        if weight >= 1.5:
-                            parts.append(f"{col}: {text}")
-                            parts.append(text)
-                        elif weight >= 1.0:
-                            parts.append(f"{col}: {text}")
-                        else:
-                            parts.append(text[:200])
-                texts.append(" ".join(parts))
             
-            embeddings = self._model.encode(
-                texts,
-                normalize_embeddings=True,
+            # OPTIMIZATION: Dynamic Quantization for CPU
+            if self._device == "cpu" and self.config.use_quantization:
+                # Silently apply quantization, optimized to suppress all logs
+                try:
+                    self._bi_encoder = torch.quantization.quantize_dynamic(
+                        self._bi_encoder, {torch.nn.Linear}, dtype=torch.qint8
+                    )
+                except Exception as e:
+                    print(f"⚠️ Quantization failed: {e}")
+            
+            # Load Cross-Encoder
+            if self.config.enable_reranking:
+                print(f"🔄 Loading Cross-Encoder: {self.config.rerank_model}")
+                self._cross_encoder = CrossEncoder(
+                    self.config.rerank_model, 
+                    device=self._device
+                )
+                
+            print("✅ Models loaded successfully")
+        except ImportError:
+            print("⚠️ sentence-transformers not found. Using MockEmbedder.")
+            pass
+            
+        self._initialized = True
+
+    def _prepare_text(self, record: dict[str, Any]) -> str:
+        """Construct weighted prompt for embedding."""
+        parts = []
+        for col in self.config.embedding_columns:
+            text = record.get(col, "")
+            if not text: continue
+            
+            weight = self.config.field_weights.get(col, 1.0)
+            section = f"{col.replace('_', ' ').title()}: {text}"
+            
+            if weight >= 2.0:
+                parts.insert(0, section)
+                parts.append(section)
+            elif weight >= 1.5:
+                parts.append(section)
+            else:
+                parts.append(text[:200])
+                
+        return "passage: " + " ".join(parts)
+
+    def _embed_sync(self, texts: list[str]) -> np.array:
+        """Run embedding in thread (sync)."""
+        if self._bi_encoder:
+            return self._bi_encoder.encode(
+                texts, 
+                batch_size=self.config.batch_size, 
+                normalize_embeddings=True, 
                 show_progress_bar=False,
-                batch_size=self.config.batch_size,
+                convert_to_numpy=True
             )
-            return embeddings
-        else:
-            return np.array([self.embed_record(r) for r in records])
-    
-    def embed_query(self, query: str) -> np.ndarray:
-        """Embed search query."""
-        if self._model is not None:
-            return self._model.encode(
-                query,
-                normalize_embeddings=True,
-                show_progress_bar=False,
+        return np.random.randn(len(texts), self.config.embedding_dimension).astype(np.float32)
+
+    async def embed_batch_async(self, records: list[dict[str, Any]]) -> np.array:
+        """Async wrapper for batch embedding (offloads to thread)."""
+        self._ensure_initialized()
+        texts = [self._prepare_text(r) for r in records]
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(self._executor, self._embed_sync, texts)
+
+    def embed_query(self, query: str) -> np.array:
+        """Embed query with correct prefix."""
+        self._ensure_initialized()
+        if self._bi_encoder:
+            return self._bi_encoder.encode(
+                f"query: {query}", 
+                normalize_embeddings=True
             )
-        else:
-            result = self.embedder.embed(query)
-            if result.is_ok():
-                return result.unwrap().to_numpy()
-            return np.random.randn(self.config.embedding_dimension).astype(np.float32)
+        return np.random.randn(self.config.embedding_dimension).astype(np.float32)
+
+    def rerank(self, query: str, results: list[dict]) -> list[dict]:
+        """Rerank top-k results using Cross-Encoder."""
+        if not self._cross_encoder or not results:
+            return results
+        
+        # Cross-encoder inference is also CPU bound, careful. 
+        # But applied only to 50 items.
+        pairs = []
+        for res in results:
+            record = res['record']
+            text = f"{record.get('professional_persona', '')} {record.get('skills_and_expertise', '')}"
+            pairs.append([query, text])
+            
+        scores = self._cross_encoder.predict(pairs)
+        
+        for res, score in zip(results, scores):
+            res['score'] = float(score)
+            
+        results.sort(key=lambda x: x['score'], reverse=True)
+        return results
 
 
 # =============================================================================
-# SOTA VECTOR INDEX
+# INDEXING & SEARCH ENGINE
 # =============================================================================
 
-class SOTAVectorIndex:
-    """
-    SOTA Vector Index with:
-        - High-quality HNSW parameters
-        - Metadata filtering
-        - Multi-field search
-        - Optional re-ranking
-    """
-    
-    def __init__(self, config: SOTAConfig, embedder: MultiFieldEmbedder):
+class SOTASearchEngine:
+    def __init__(self, config: SOTAConfig):
         self.config = config
-        self.embedder = embedder
+        self.embedder = SOTAEmbedder(config)
+        self.ap_store = create_ap_store()
         
-        # Create HNSW with SOTA parameters
         hnsw_config = HNSWConfig(
             dimension=config.embedding_dimension,
             M=config.hnsw_M,
             ef_construction=config.hnsw_ef_construction,
             ef_search=config.hnsw_ef_search,
             metric=config.metric,
-            max_elements=config.max_samples + 1000,
+            max_elements=config.max_samples + 2000
         )
-        
         self.index = HNSWIndex(config=hnsw_config)
         
-        # Metadata storage
-        self.id_to_record: dict[str, dict] = {}
-        self.filter_indices: dict[str, dict[str, set]] = defaultdict(lambda: defaultdict(set))
-    
-    def add_record(self, record: dict[str, Any], embedding: np.ndarray) -> str:
-        """Add record with embedding to index."""
-        # Generate stable ID from UUID or hash
-        record_id = record.get("uuid", hashlib.md5(str(record).encode()).hexdigest()[:16])
-        vid = VectorId(value=record_id)
-        
-        # Store in index
-        vec = EmbeddingVector.from_numpy(embedding)
-        result = self.index.insert(vid, vec, metadata=self._extract_metadata(record))
-        
-        if result.is_err():
-            print(f"⚠️ Insert failed: {result}")
-            return None
-        
-        # Store full record
-        self.id_to_record[record_id] = record
-        
-        # Build filter indices
-        for col in FILTER_COLUMNS:
-            val = record.get(col)
-            if val is not None:
-                self.filter_indices[col][str(val)].add(record_id)
-        
-        return record_id
-    
-    def _extract_metadata(self, record: dict) -> dict:
-        """Extract filterable metadata."""
-        return {col: record.get(col) for col in FILTER_COLUMNS if record.get(col)}
-    
-    def search(
-        self,
-        query: str,
-        k: int = 10,
-        filters: Optional[dict[str, Any]] = None,
-        include_scores: bool = True,
-    ) -> list[dict]:
-        """
-        SOTA search with optional filtering.
-        
-        Steps:
-            1. Embed query
-            2. Search HNSW (fetch more if filtering)
-            3. Apply filters
-            4. Return top-k
-        """
-        # Embed query
-        query_embedding = self.embedder.embed_query(query)
-        query_vec = EmbeddingVector.from_numpy(query_embedding)
-        
-        # Fetch more if filtering (to compensate for filtered-out results)
-        fetch_k = k * 5 if filters else k
-        
-        # Search
-        search_query = SearchQuery(
-            vector=query_vec,
-            k=fetch_k,
-            include_metadata=True,
-        )
-        
-        result = self.index.search(search_query)
-        
-        if result.is_err():
-            print(f"⚠️ Search failed: {result}")
-            return []
-        
-        search_results = result.unwrap()
-        
-        # Apply filters
-        filtered_results = []
-        for match in search_results.matches:
-            record_id = match.id.value
-            record = self.id_to_record.get(record_id, {})
-            
-            # Check filters
-            if filters:
-                passes = True
-                for filter_col, filter_val in filters.items():
-                    record_val = record.get(filter_col)
-                    if isinstance(filter_val, list):
-                        if record_val not in filter_val:
-                            passes = False
-                            break
-                    elif record_val != filter_val:
-                        passes = False
-                        break
+        # Async Pipeline
+        self.queue = asyncio.Queue(maxsize=config.pipeline_queue_size)
+        self.workers = []
+        self.stats = {"indexed": 0, "persistence_writes": 0}
+
+    async def start(self):
+        """Start async workers."""
+        if not self.workers:
+            for _ in range(self.config.num_workers):
+                task = asyncio.create_task(self._worker_loop())
+                self.workers.append(task)
+            print(f"🚀 Started {len(self.workers)} ingestion workers")
+
+    async def stop(self):
+        """Stop workers and empty queue."""
+        await self.queue.join()  # Wait for queue to empty
+        for task in self.workers:
+            task.cancel()
+        self.workers = []
+
+    async def enqueue_batch(self, batch: list[dict]):
+        """Producer: push batch to queue."""
+        await self.queue.put(batch)
+
+    async def _worker_loop(self):
+        """Consumer: Embed -> Index -> Store."""
+        while True:
+            try:
+                batch = await self.queue.get()
+                t_start = time.perf_counter()
                 
-                if not passes:
-                    continue
-            
-            # Build result
-            result_dict = {
-                "id": record_id,
-                "score": match.score,
-                "record": record,
-            }
-            filtered_results.append(result_dict)
-            
-            if len(filtered_results) >= k:
+                # 1. Embed (Async Offload)
+                t_embed_0 = time.perf_counter()
+                embeddings = await self.embedder.embed_batch_async(batch)
+                t_embed = time.perf_counter() - t_embed_0
+                
+                items_to_store = {}
+                
+                # 2. Index & Prepare
+                t_index_0 = time.perf_counter()
+                for record, vec in zip(batch, embeddings):
+                    rid = record.get("uuid") or hashlib.md5(str(record).encode()).hexdigest()[:16]
+                    vid = VectorId(value=rid)
+                    meta = {k: record.get(k) for k in FILTER_COLUMNS if record.get(k)}
+                    
+                    self.index.insert(vid, EmbeddingVector.from_numpy(vec), metadata=meta)
+                    items_to_store[rid] = record
+                t_index = time.perf_counter() - t_index_0
+                    
+                # 3. Persist (Async IO)
+                t_store_0 = time.perf_counter()
+                result = await self.ap_store.multi_put(items_to_store)
+                t_store = time.perf_counter() - t_store_0
+                
+                if result.is_ok():
+                    self.stats["persistence_writes"] += len(batch)
+                
+                self.stats["indexed"] += len(batch)
+                t_total = time.perf_counter() - t_start
+                self.queue.task_done()
+                
+                # Profile Log (First batch of each worker or every 10th)
+                if self.stats["indexed"] % (self.config.batch_size * 5) == 0:
+                    print(f"   ⏱️ [Worker] Batch ({len(batch)}): Embed={t_embed:.2f}s, Index={t_index:.2f}s, Store={t_store:.2f}s | Speed={len(batch)/t_total:.1f} r/s")
+                
+            except asyncio.CancelledError:
                 break
+            except Exception as e:
+                print(f"⚠️ Worker Error: {e}")
+                self.queue.task_done()
+
+    async def search(self, query: str, filters: dict = None) -> list[dict]:
+        k_fetch = self.config.rerank_top_k if self.config.enable_reranking else self.config.final_k
+        query_vec = self.embedder.embed_query(query)
         
-        return filtered_results
-    
-    def semantic_search(
-        self,
-        query: str,
-        k: int = 10,
-        state_filter: Optional[str] = None,
-        occupation_filter: Optional[str] = None,
-    ) -> list[dict]:
-        """Convenience search with common filters."""
-        filters = {}
-        if state_filter:
-            filters["state"] = state_filter
-        if occupation_filter:
-            filters["occupation"] = occupation_filter
+        sq = SearchQuery(
+            vector=EmbeddingVector.from_numpy(query_vec),
+            k=k_fetch,
+            include_metadata=True
+        )
+        t0 = time.time()
+        idx_result = self.index.search(sq)
+        if idx_result.is_err(): return []
+        t_search = time.time() - t0
         
-        return self.search(query, k=k, filters=filters if filters else None)
-    
-    def stats(self) -> dict:
-        """Get index statistics."""
-        index_stats = self.index.stats()
-        return {
-            "total_records": len(self.id_to_record),
-            "index_vectors": index_stats.total_vectors,
-            "dimension": index_stats.dimension,
-            "memory_mb": index_stats.index_size_bytes / 1024 / 1024,
-            "filter_columns": list(self.filter_indices.keys()),
-        }
+        matches = idx_result.unwrap().matches
+        
+        candidates = []
+        ids_to_fetch = []
+        match_map = {}
+        
+        for match in matches:
+            rid = match.id.value
+            
+            # Simple Filter Check
+            if filters and match.metadata:
+                skip = False
+                for k, v in filters.items():
+                    if match.metadata.get(k) != v:
+                        skip = True; break
+                if skip: continue
+            
+            ids_to_fetch.append(rid)
+            match_map[rid] = match.score
+
+        if ids_to_fetch:
+            dm_result = await self.ap_store.multi_get(ids_to_fetch)
+            if dm_result.is_ok():
+                data_map = dm_result.unwrap()
+                for rid, record in data_map.items():
+                    candidates.append({
+                        "id": rid,
+                        "score": match_map[rid],
+                        "record": record
+                    })
+        
+        t1 = time.time()
+        if self.config.enable_reranking and candidates:
+            candidates = self.embedder.rerank(query, candidates)
+        t_rerank = time.time() - t1
+        
+        print(f"   (Profile: Search={t_search*1000:.0f}ms, Rerank={t_rerank*1000:.0f}ms)")
+        return candidates[:self.config.final_k]
 
 
 # =============================================================================
-# DATASET PROCESSOR
+# RUNNER
 # =============================================================================
 
-class DatasetProcessor:
-    """Process streaming dataset with batching."""
+async def run_pipeline(config: SOTAConfig):
+    print(f"🚀 Starting High-Performance SOTA Pipeline")
+    print(f"Dataset: {config.dataset_name}")
+    print(f"Config: Batch={config.batch_size}, Workers={config.num_workers}, Quantization={config.use_quantization}")
+    print(f"HNSW: M={config.hnsw_M}, ef_c={config.hnsw_ef_construction}")
     
-    def __init__(self, config: SOTAConfig):
-        self.config = config
+    engine = SOTASearchEngine(config)
+    await engine.start()
     
-    def stream_records(self) -> Iterator[dict]:
-        """Stream records from HuggingFace dataset."""
-        try:
-            from datasets import load_dataset
-            
-            print(f"📂 Loading dataset: {self.config.dataset_name}")
-            dataset = load_dataset(
-                self.config.dataset_name,
-                split=self.config.dataset_split,
-                streaming=True,
-            )
-            
-            count = 0
-            for record in dataset:
-                if count >= self.config.max_samples:
-                    break
-                yield dict(record)
-                count += 1
-                
-        except ImportError:
-            print("⚠️ datasets not installed, generating synthetic data")
-            for i in range(min(100, self.config.max_samples)):
-                yield {
-                    "uuid": f"synthetic-{i}",
-                    "professional_persona": f"Professional persona {i} in technology",
-                    "skills_and_expertise": f"Python, ML, data science",
-                    "occupation": "Software Engineer",
-                    "state": "São Paulo",
-                    "country": "Brasil",
-                }
-    
-    def batch_iterator(self, batch_size: int = None) -> Iterator[list[dict]]:
-        """Yield records in batches."""
-        batch_size = batch_size or self.config.batch_size
+    try:
+        from datasets import load_dataset
+        print("📂 Streaming dataset...")
+        ds = load_dataset(config.dataset_name, split=config.dataset_split, streaming=True)
+        
         batch = []
+        t0 = time.time()
         
-        for record in self.stream_records():
-            batch.append(record)
-            if len(batch) >= batch_size:
-                yield batch
+        for i, record in enumerate(ds):
+            if i >= config.max_samples: break
+            
+            batch.append(dict(record))
+            
+            if len(batch) >= config.batch_size:
+                await engine.enqueue_batch(batch)
                 batch = []
+                if i % 100 == 0:
+                     print(f"   Indexed: {engine.stats['indexed']}...", end="\r")
+                
+        if batch: await engine.enqueue_batch(batch)
         
-        if batch:
-            yield batch
-
-
-# =============================================================================
-# MAIN INTEGRATION
-# =============================================================================
-
-def run_sota_integration(config: Optional[SOTAConfig] = None):
-    """Run SOTA integration demo."""
-    config = config or SOTAConfig()
-    
-    print("=" * 70)
-    print("SOTA Vector Search Integration Demo")
-    print("Dataset: nvidia/Nemotron-Personas-Brazil")
-    print("=" * 70)
-    
-    # Initialize components
-    print("\n🔧 Initializing SOTA components...")
-    embedder = MultiFieldEmbedder(config)
-    index = SOTAVectorIndex(config, embedder)
-    processor = DatasetProcessor(config)
-    
-    # Process dataset
-    print(f"\n📊 Processing up to {config.max_samples:,} records...")
-    start_time = time.time()
-    total_records = 0
-    
-    for batch in processor.batch_iterator():
-        # Batch embed
-        embeddings = embedder.embed_batch(batch)
+        await engine.stop()
         
-        # Add to index
-        for record, embedding in zip(batch, embeddings):
-            record_id = index.add_record(record, embedding)
-            if record_id:
-                total_records += 1
+        dt = time.time() - t0
+        print(f"\n✅ Ingestion complete: {engine.stats['indexed']} records in {dt:.2f}s ({engine.stats['indexed']/dt:.1f} rec/s)")
         
-        if total_records % 100 == 0:
-            print(f"   Processed {total_records} records...")
-    
-    elapsed = time.time() - start_time
-    print(f"\n✅ Indexed {total_records} records in {elapsed:.2f}s")
-    print(f"   Throughput: {total_records/elapsed:.1f} records/sec")
-    
-    # Print stats
-    print("\n📈 Index Statistics:")
-    stats = index.stats()
-    for key, value in stats.items():
-        if isinstance(value, float):
-            print(f"   {key}: {value:.2f}")
-        else:
-            print(f"   {key}: {value}")
-    
-    # Example searches
-    print("\n" + "=" * 70)
-    print("🔍 SOTA Semantic Search Examples")
-    print("=" * 70)
-    
-    test_queries = [
-        ("software developer with machine learning skills", None),
-        ("professional in healthcare field", {"state": "São Paulo"}),
-        ("creative artist passionate about music", None),
-        ("entrepreneur with business goals", None),
-        ("teacher in education sector", None),
+    except ImportError:
+        print("❌ datasets lib not installed.")
+        return
+
+    # --- Search Demonstrations ---
+    queries = [
+        ("Software engineer with Python skills", None),
+        ("Healthcare professional in São Paulo", {"state": "São Paulo"}),
+        ("Creative writer interested in sci-fi", None)
     ]
     
-    for query, filters in test_queries:
-        print(f"\n📌 Query: '{query}'")
-        if filters:
-            print(f"   Filters: {filters}")
-        
-        results = index.search(query, k=3, filters=filters)
-        
-        if not results:
-            print("   No results found.")
-            continue
-        
-        for i, result in enumerate(results):
-            record = result["record"]
-            score = result["score"]
-            
-            # Display key fields
-            name = record.get("name", "Unknown")
-            occupation = record.get("occupation", "Unknown")
-            state = record.get("state", "Unknown")
-            prof_persona = record.get("professional_persona", "")[:100]
-            
-            print(f"\n   [{i+1}] Score: {score:.4f}")
-            print(f"       Name: {name}")
-            print(f"       Occupation: {occupation}")
-            print(f"       State: {state}")
-            print(f"       Persona: {prof_persona}...")
+    print("\n🔍 Running SOTA Search Queries...")
     
-    print("\n" + "=" * 70)
-    print("✅ SOTA Integration Demo Complete!")
-    print("=" * 70)
-    
-    return index
-
-
-# =============================================================================
-# CLI ENTRY POINT
-# =============================================================================
+    for q, f in queries:
+        print(f"\n❓ Query: {q} (Filters: {f})")
+        results = await engine.search(q, filters=f)
+        
+        for i, res in enumerate(results):
+            rec = res['record']
+            print(f"   {i+1}. [{res['score']:.4f}] {rec.get('occupation')} - {rec.get('professional_persona')[:80]}...")
 
 if __name__ == "__main__":
     import argparse
-    
-    parser = argparse.ArgumentParser(description="SOTA VectorSearch Integration")
-    parser.add_argument("--max-samples", type=int, default=500, help="Max records to process")
-    parser.add_argument("--batch-size", type=int, default=16, help="Embedding batch size")
-    parser.add_argument("--ef-search", type=int, default=100, help="HNSW ef_search parameter")
-    parser.add_argument("--model", default="sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2")
-    
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--max-samples", type=int, default=1000)
     args = parser.parse_args()
     
-    config = SOTAConfig(
-        max_samples=args.max_samples,
-        batch_size=args.batch_size,
-        hnsw_ef_search=args.ef_search,
-        embedding_model=args.model,
-    )
-    
-    run_sota_integration(config)
+    cfg = SOTAConfig(max_samples=args.max_samples)
+    asyncio.run(run_pipeline(cfg))

@@ -7,6 +7,7 @@ Provides unified interface for embedding providers:
     - Cohere embed-v3
     - Anthropic (via Voyage)
     - LangChain wrapper
+    - SPLADE v2 learned sparse encoder
 
 All providers implement EmbedderProtocol for drop-in replacement.
 """
@@ -37,4 +38,11 @@ def __getattr__(name: str):
     if name == "LangChainEmbedder":
         from vector_search.embeddings.langchain import LangChainEmbedder
         return LangChainEmbedder
+    if name == "SPLADEEncoder":
+        from vector_search.embeddings.splade import SPLADEEncoder
+        return SPLADEEncoder
+    if name == "SPLADEConfig":
+        from vector_search.embeddings.splade import SPLADEConfig
+        return SPLADEConfig
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
